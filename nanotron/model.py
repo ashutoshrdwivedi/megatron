@@ -91,7 +91,7 @@ class CasualSelfAttention(eqx.Module):
         )
 
     def __call__(
-        self, x: Float[Array, "n_tokens n_embed"]
+        self, x: Float[Array, "n_tokens n_embed"], mask:Optional[Integer[Array, "n_tokens n_tokens"]] = None
     ) -> Tuple[Float[Array, "n_tokens n_embed"], Float[Array, "n_tokens n_tokens"]]:
         """
         Args:
@@ -102,8 +102,12 @@ class CasualSelfAttention(eqx.Module):
                 - Attention weights of shape (n_tokens, n_tokens)
         """
         n_tokens = x.shape[0]
-        mask = jnp.tril(jnp.ones((n_tokens, n_tokens)))
-        return self.mha(x, mask=mask)
+        causal_mask = jnp.tril(jnp.ones((n_tokens, n_tokens), dtype=bool))
+        if mask is not None:
+            final_mask = causal_mask & mask
+        else:
+            final_mask = causal_mask
+        return self.mha(x, mask=final_mask)
 
 
 class Block(eqx.Module):
@@ -121,11 +125,11 @@ class Block(eqx.Module):
         self.mlp = MLP(key=key_mlp, model_config=model_config)
 
     def __call__(
-        self, key: PRNGKeyArray, x: Float[Array, "n_tokens n_embed"]
+        self, key: PRNGKeyArray, x: Float[Array, "n_tokens n_embed"], mask:Optional[Integer[Array, "n_tokens n_tokens"]] = None
     ) -> Float[Array, "n_tokens n_embed"]:
         mlp_keys = jax.random.split(key, x.shape[0])  # Create a key for each token
         x = jax.vmap(self.ln_1)(x)
-        output_embeddings, attn = self.attn(x)
+        output_embeddings, attn = self.attn(x, mask=mask)
         x = x + output_embeddings
         x = jax.vmap(self.ln_2)(x)
         x = x + jax.vmap(self.mlp)(mlp_keys, x)
@@ -166,6 +170,7 @@ class Transformer(eqx.Module):
         self,
         key: PRNGKeyArray,
         tokens: Integer[Array, "n_tokens"],
+        mask:Optional[Integer[Array, "sequence_length sequence_length"]] = None,
         inference: bool = False,
     ) -> Float[Array, "n_tokens n_embed"]:
         pos = jnp.arange(0, len(tokens), dtype=jnp.int32)
@@ -175,7 +180,7 @@ class Transformer(eqx.Module):
             t_embed + p_embed, inference=inference, key=key
         )  # TODO: confirm why is key optional in params
         for block in self.h:
-            x = block(key, x)
+            x = block(key, x, mask=mask)
         x = jax.vmap(self.ln_f)(x)
         return x
 
@@ -199,9 +204,10 @@ class GPT(eqx.Module):
         self,
         key: PRNGKeyArray,
         tokens: Integer[Array, "n_tokens"],
+        mask:Optional[Integer[Array, "n_tokens n_tokens"]] = None,
         inference: bool = False,
     ) -> Float[Array, "n_tokens vocab_size"]:
-        x = self.transformer(key, tokens, inference=inference)
+        x = self.transformer(key, tokens, mask=mask, inference=inference)
         if not inference:
             logits = jax.vmap(self.lm_head)(x)  # (n_tokens, vocab_size)
         else:
@@ -226,34 +232,33 @@ class GPT(eqx.Module):
         tokens = jnp.concatenate([initial_tokens, padding], axis=-1)
         indexes = jnp.arange(input_token_len, input_token_len + max_new_tokens)
 
-        def step(tokens: Integer[Array, "n_tokens + max_new_tokens"], i: int):
+        def step(tokens, i):
             step_key = jax.random.fold_in(key, i)
             model_key, sample_key = jax.random.split(step_key)
 
-            valid = jnp.arange(tokens.shape[0]) < i
+            key_mask = jnp.arange(tokens.shape[0]) <= i   # (T,)
+            mask = key_mask[None, :]  # shape (1, T)
 
-            logits = self(model_key, tokens, inference=True)
-            logits = jnp.where(valid[:, None], logits, -jnp.inf)
-            jax.debug.print("tokens {}, logits {}", tokens.shape, logits.shape)
-            logits = logits[i - 1] / temperature
+            logits = self(model_key, tokens, mask=mask, inference=False) # use inference=False to get all logits
+            logits = logits[i - 1, :] # get the logits for the next token
+            logits = jnp.expand_dims(logits, axis=0) # shape (1, vocab)
+
+            # inference=True → logits shape (1, vocab)
+            logits = logits[0] / temperature
 
             if top_k is not None:
                 top_logits, top_tokens = jax.lax.top_k(
                     logits, min(top_k, logits.shape[-1])
                 )
-                token_idx = jax.random.categorical(sample_key, top_logits, axis=-1)
-                next_token = jnp.take_along_axis(
-                    top_tokens, jnp.expand_dims(token_idx, 0), axis=-1
-                ).squeeze(-1)
+                token_idx = jax.random.categorical(sample_key, top_logits)
+                next_token = top_tokens[token_idx]
             else:
-                next_token = jax.random.categorical(sample_key, logits, axis=-1)
+                next_token = jax.random.categorical(sample_key, logits)
+
             tokens = tokens.at[i].set(next_token)
+            return tokens, None
 
-            return tokens, logits
-
-        tokens, all_logits = jax.lax.scan(step, tokens, indexes)
-
-        jax.debug.print("all_logits: {}", all_logits.shape)
+        tokens, _ = jax.lax.scan(step, tokens, indexes)
 
         return tokens
 
@@ -283,9 +288,10 @@ class GPT(eqx.Module):
 
         for i in range(max_new_tokens):
             # Get key for this iteration
-            key, subkey = jax.random.split(key)
+            subkey = jax.random.fold_in(key, i)
+            model_key, sample_key = jax.random.split(subkey)
             # during inference, we only get last token logits
-            logits = self(subkey, tokens, inference=True)  # (1, vocab_size)
+            logits = self(model_key, tokens, inference=True)  # (1, vocab_size)
             logits = logits / temperature
 
             if top_k is not None:
@@ -296,7 +302,7 @@ class GPT(eqx.Module):
             # jax.random.categorical expects log-probabilities. The logits are
             # already unnormalized log-probabilities, so we pass them directly
             # after applying temperature scaling and optional top-k filtering.
-            next_token = jax.random.categorical(subkey, logits[0])
+            next_token = jax.random.categorical(sample_key, logits[0])
             print(f"Generated token {i + 1}/{max_new_tokens}: {next_token}")
             tokens = jnp.append(tokens, next_token)
 
