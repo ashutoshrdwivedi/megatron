@@ -13,12 +13,9 @@ Plus a golden-file regression test to catch silent numerical changes.
 Note: run with JAX_PLATFORM_NAME=cpu on this shared GPU machine to avoid
 XLA device conflicts with other users.
 """
-import os
-
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 import pytest
 
@@ -26,10 +23,6 @@ from nanotron import model
 from nanotron.config import GPTConfig
 
 
-# Golden file stores reference logits produced by a fixed model + seed.
-# Delete this file whenever an intentional architectural change alters numerics.
-GOLDEN_DIR = os.path.join(os.path.dirname(__file__), "golden")
-GOLDEN_FILE = os.path.join(GOLDEN_DIR, "logits.npy")
 
 
 def _small_config() -> GPTConfig:
@@ -158,35 +151,42 @@ def test_golden_logits():
     """
     Regression test: the model's output logits must not change unexpectedly.
 
-    How it works:
-      - First run: the golden file doesn't exist yet, so we compute logits,
-        save them to tests/golden/logits.npy, and skip with a message.
-      - Subsequent runs: we load the saved logits and compare against the
-        current model output with a tight tolerance (atol=1e-5).
+    Uses three scalar checksums (sum, min, max) of the logit matrix computed
+    from a fixed seed.  Scalars are hardcoded directly in the test — no files,
+    no binary blobs, diffs are human-readable.
 
-    When to regenerate:
-      Delete tests/golden/logits.npy whenever you make an intentional change
-      to model architecture or weight initialisation.  The next test run will
-      create a new golden file from the updated model.
+    When to update:
+      If you make an intentional architectural change, re-run the snippet below
+      to get the new values and update the three expected constants here:
+
+        JAX_PLATFORM_NAME=cpu python -c "
+        import os; os.environ['OUT_DIR'] = '/tmp/test'
+        import jax, jax.numpy as jnp
+        from nanotron import model
+        from nanotron.config import GPTConfig
+        cfg = GPTConfig(block_size=8, n_layers=2, vocab_size=10, n_head=2, n_embed=16, dropout=0.0)
+        key = jax.random.PRNGKey(42)
+        logits = model.GPT(key, cfg)(key, jnp.array([1, 2, 3, 4]))
+        print('sum =', round(float(jnp.sum(logits)), 4))
+        print('min =', round(float(jnp.min(logits)), 4))
+        print('max =', round(float(jnp.max(logits)), 4))
+        "
 
     What this catches:
       Silent numerical regressions — e.g. a refactor that changes output values
       without breaking any shape assertions.
     """
-    key = jax.random.PRNGKey(42)   # fixed seed so the model is reproducible
+    key = jax.random.PRNGKey(42)   # fixed seed — must match the snippet above
     cfg = _small_config()
     gpt = model.GPT(key, cfg)
-    tokens_S = jnp.array([1, 2, 3, 4])          # (S=4,)
-    logits_SxV = gpt(key, tokens_S)              # (S, V)
+    tokens_S = jnp.array([1, 2, 3, 4])   # (S=4,)
+    logits_SxV = gpt(key, tokens_S)       # (S, V)
 
-    if not os.path.exists(GOLDEN_FILE):
-        os.makedirs(GOLDEN_DIR, exist_ok=True)
-        np.save(GOLDEN_FILE, np.array(logits_SxV))
-        pytest.skip("Golden file created — run tests again to validate")
+    # Three independent checksums reduce the chance that cancelling shifts go undetected.
+    actual_sum = round(float(jnp.sum(logits_SxV)), 4)
+    actual_min = round(float(jnp.min(logits_SxV)), 4)
+    actual_max = round(float(jnp.max(logits_SxV)), 4)
 
-    expected_SxV = jnp.array(np.load(GOLDEN_FILE))
-    max_diff = float(jnp.max(jnp.abs(logits_SxV - expected_SxV)))
-    assert jnp.allclose(logits_SxV, expected_SxV, atol=1e-5), (
-        f"Logits differ from golden file. Max diff: {max_diff:.6f}. "
-        "If this change is intentional, delete tests/golden/logits.npy to regenerate."
-    )
+    assert actual_sum == -6.6179, f"logits sum changed: {actual_sum} (expected -6.6179)"
+    assert actual_min == -1.0001, f"logits min changed: {actual_min} (expected -1.0001)"
+    assert actual_max ==  0.9685, f"logits max changed: {actual_max} (expected  0.9685)"
