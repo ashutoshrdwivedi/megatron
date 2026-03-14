@@ -1,0 +1,7 @@
+- This project uses only jax and equinox for building models.
+- Every method has a type annotations. Jax tensors are annotated with jaxtyping.
+- The implementation is oriented towards readability and hackability
+- ❯ Since this repo is built for hackability and readability. Explain each test and feature well in the code, add comments or documentation wherenever needed
+- before implementing any feature, ask if the tests should be added and ask me to verify them after implementation
+- use the Noam Notation(Shape Suffix Notation) with x as the seperator for tensor variables names. (inputs_BLD becomes inputs_BxLxD)
+- B = batch, S = sequence, E = embedding dim, H = heads, D = head dim, V = vocab, Dh = head_dim//2 (RoPE), BS = batch×seq flattened, Sq/Sk = query/key seq when asymmetric
