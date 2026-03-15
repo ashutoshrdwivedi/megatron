@@ -125,15 +125,24 @@ class Block(eqx.Module):
         self.ln_2 = nn.LayerNorm(model_config.n_embed, use_bias=model_config.bias)
         self.mlp = MLP(key=key_mlp, model_config=model_config)
 
-    def __call__(
-        self, key: PRNGKeyArray, x: Float[Array, "n_tokens n_embed"], mask:Optional[Integer[Array, "n_tokens n_tokens"]] = None
-    ) -> Float[Array, "n_tokens n_embed"]:
-        mlp_keys = jax.random.split(key, x.shape[0])  # Create a key for each token
-        x = jax.vmap(self.ln_1)(x)
-        output_embeddings, attn = self.attn(x, mask=mask)
-        x = x + output_embeddings
-        x = jax.vmap(self.ln_2)(x)
-        x = x + jax.vmap(self.mlp)(mlp_keys, x)
+def __call__(self, key, x, mask=None):
+        # 1. Attention Block
+        # We normalize ONLY for the attention calculation
+        normalized_x = jax.vmap(self.ln_1)(x) 
+        output_embeddings, attn = self.attn(normalized_x, mask=mask)
+        
+        # We add the result back to the ORIGINAL, un-normalized x
+        x = x + output_embeddings 
+
+        # 2. MLP Block
+        # We normalize the UPDATED x ONLY for the MLP calculation
+        normalized_x2 = jax.vmap(self.ln_2)(x)
+        mlp_keys = jax.random.split(key, x.shape[0])s        
+        mlp_out = jax.vmap(self.mlp)(mlp_keys, normalized_x2)
+        
+        # Add the MLP result back to the residual highway
+        x = x + mlp_out
+        
         return x
 
 
