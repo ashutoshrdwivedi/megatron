@@ -87,7 +87,8 @@ class CasualSelfAttention(eqx.Module):
 
     def __init__(self, key: PRNGKeyArray, model_config: GPTConfig) -> None:
         self.mha = attention.MultiHeadAttention(
-            key=key, n_embed=model_config.n_embed, n_heads=model_config.n_head
+            key=key, n_embed=model_config.n_embed, n_heads=model_config.n_head,
+            rope_theta=model_config.rope_theta,
         )
 
     def __call__(
@@ -138,24 +139,18 @@ class Block(eqx.Module):
 
 class Transformer(eqx.Module):
     wte: nn.Embedding
-    wpe: nn.Embedding
     drop: nn.Dropout
     h: List[Block]
     ln_f: nn.LayerNorm
 
     def __init__(self, key: PRNGKeyArray, model_config: GPTConfig) -> None:
-        te_key, pe_key, h_key = jax.random.split(key, 3)
+        te_key, h_key = jax.random.split(key, 2)
 
-        # token embeddings
+        # token embeddings — position information is injected by RoPE inside
+        # each attention layer, so no separate positional embedding table is needed.
         self.wte = nn.Embedding(
             key=te_key,
             num_embeddings=model_config.vocab_size,
-            embedding_size=model_config.n_embed,
-        )
-        # positional embeddings
-        self.wpe = nn.Embedding(
-            key=pe_key,
-            num_embeddings=model_config.block_size,
             embedding_size=model_config.n_embed,
         )
         self.drop = nn.Dropout(model_config.dropout)
@@ -170,15 +165,11 @@ class Transformer(eqx.Module):
         self,
         key: PRNGKeyArray,
         tokens: Integer[Array, "n_tokens"],
-        mask:Optional[Integer[Array, "sequence_length sequence_length"]] = None,
+        mask: Optional[Integer[Array, "sequence_length sequence_length"]] = None,
         inference: bool = False,
     ) -> Float[Array, "n_tokens n_embed"]:
-        pos = jnp.arange(0, len(tokens), dtype=jnp.int32)
-        t_embed = jax.vmap(self.wte)(tokens)  # token embeddings
-        p_embed = jax.vmap(self.wpe)(pos)  # positional embedidngs
-        x = self.drop(
-            t_embed + p_embed, inference=inference, key=key
-        )  # TODO: confirm why is key optional in params
+        t_embed = jax.vmap(self.wte)(tokens)  # (n_tokens, n_embed)
+        x = self.drop(t_embed, inference=inference, key=key)
         for block in self.h:
             x = block(key, x, mask=mask)
         x = jax.vmap(self.ln_f)(x)

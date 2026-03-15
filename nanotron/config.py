@@ -16,6 +16,7 @@ class GPTConfig:
     n_embed: int = 384
     dropout: float = 0.2
     bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    rope_theta: float = 10000.0  # base frequency for rotary position embeddings
 
 
 @dataclass
