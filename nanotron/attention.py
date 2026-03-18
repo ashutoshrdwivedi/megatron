@@ -101,14 +101,14 @@ def apply_rope(
     head_dim = x_HxSxD.shape[-1]
 
     # Split the dimensions directly in half for hardware contiguous memory
-    x1 = x_HxSxD[..., : head_dim // 2]  # (H, S, Dh)
-    x2 = x_HxSxD[..., head_dim // 2 :]  # (H, S, Dh)
+    x1_HxSxDh = x_HxSxD[..., : head_dim // 2]  # (H, S, Dh)
+    x2_HxSxDh = x_HxSxD[..., head_dim // 2 :]  # (H, S, Dh)
 
-    rotated_x1 = x1 * cos_SxDh - x2 * sin_SxDh
-    rotated_x2 = x1 * sin_SxDh + x2 * cos_SxDh
+    rotated_x1_HxSxDh = x1_HxSxDh * cos_SxDh - x2_HxSxDh * sin_SxDh  # broadcasting
+    rotated_x2_HxSxDh = x1_HxSxDh * sin_SxDh + x2_HxSxDh * cos_SxDh  # broadcasting
 
     # Stitch the halves back together
-    return jnp.concatenate([rotated_x1, rotated_x2], axis=-1)  # (H, S, D)
+    return jnp.concatenate([rotated_x1_HxSxDh, rotated_x2_HxSxDh], axis=-1)  # (H, S, D)
 
 
 def scaled_dot_product(
