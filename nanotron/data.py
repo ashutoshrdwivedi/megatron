@@ -1,8 +1,10 @@
+from __future__ import annotations
 import jax
+
 from datasets import load_dataset
 from jax import numpy as jnp
-from jaxtyping import Float, Array, PRNGKeyArray
-from typing import Any, Dict, Generator, Optional, Tuple, Callable
+from jaxtyping import PRNGKeyArray
+from typing import Any, Dict, Generator, Optional, Tuple
 
 dataset_name = "karpathy/tiny_shakespeare"
 _cached_vocab_info: Optional[Dict[str, Any]] = None

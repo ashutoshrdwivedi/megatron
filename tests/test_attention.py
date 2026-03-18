@@ -6,6 +6,7 @@ Covers three layers of correctness:
   2. expand_mask         — utility that broadcasts masks to 4D
   3. MultiHeadAttention  — the full module (projection → split heads → attend → merge)
 """
+
 import jax
 import jax.numpy as jnp
 
@@ -26,7 +27,7 @@ def test_scaled_dot_product_shape():
         q_SxD[None, :], k_SxD[None, :], v_SxD[None, :]
     )
     assert values_HxSxD.shape == (1, 2, 4)  # (H, S, D)
-    assert attn_HxSxS.shape == (1, 2, 2)    # (H, Sq, Sk)
+    assert attn_HxSxS.shape == (1, 2, 2)  # (H, Sq, Sk)
 
 
 def test_attention_rows_sum_to_one():
@@ -64,8 +65,12 @@ def test_causal_mask_strict():
     _, attn_HxSxS = mha(x_SxE, mask=causal_mask_SxS)  # attn: (H, S, S)
 
     # The upper triangle (j > i) is the complement of the causal mask.
-    upper_SxS = ~causal_mask_SxS  # equivalent to triu(..., k=1), but derived from the same mask
-    assert jnp.all(attn_HxSxS[:, upper_SxS] == 0.0), "Future tokens have non-zero attention weight"
+    upper_SxS = (
+        ~causal_mask_SxS
+    )  # equivalent to triu(..., k=1), but derived from the same mask
+    assert jnp.all(attn_HxSxS[:, upper_SxS] == 0.0), (
+        "Future tokens have non-zero attention weight"
+    )
 
 
 def test_attention_deterministic():
@@ -90,10 +95,10 @@ def test_expand_mask():
     expand_mask must broadcast a 2-D mask up to 4-D (B, H, Sq, Sk)
     so it can be applied uniformly across all heads in MultiHeadAttention.
     """
-    mask_SqxSk = jnp.ones((2, 3))         # (Sq=2, Sk=3)
+    mask_SqxSk = jnp.ones((2, 3))  # (Sq=2, Sk=3)
     out_BxHxSqxSk = attention.expand_mask(mask_SqxSk)
     assert out_BxHxSqxSk.ndim == 4
-    assert out_BxHxSqxSk.shape[-2:] == (2, 3)   # spatial dims must be preserved
+    assert out_BxHxSqxSk.shape[-2:] == (2, 3)  # spatial dims must be preserved
 
 
 def test_multi_head_attention_output_shape():
@@ -107,5 +112,5 @@ def test_multi_head_attention_output_shape():
     mha = attention.MultiHeadAttention(key, n_embed=n_embed, n_heads=n_heads)
     x_SxE = jax.random.normal(key, (seq_len, n_embed))  # (S=3, E=8)
     values_SxE, attn_HxSxS = mha(x_SxE)
-    assert values_SxE.shape == (seq_len, n_embed)        # (S, E)
+    assert values_SxE.shape == (seq_len, n_embed)  # (S, E)
     assert attn_HxSxS.shape == (n_heads, seq_len, seq_len)  # (H, S, S)

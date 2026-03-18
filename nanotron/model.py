@@ -1,11 +1,11 @@
+from __future__ import annotations
 import equinox as eqx
 import jax
 
 from equinox import nn
-from dataclasses import dataclass
 from jax import numpy as jnp
 from jaxtyping import Integer, Float, Array, PRNGKeyArray
-from typing import List, Tuple, Optional, Union
+from typing import List, Tuple, Optional
 
 from . import attention
 from .config import GPTConfig
@@ -87,12 +87,16 @@ class CasualSelfAttention(eqx.Module):
 
     def __init__(self, key: PRNGKeyArray, model_config: GPTConfig) -> None:
         self.mha = attention.MultiHeadAttention(
-            key=key, n_embed=model_config.n_embed, n_heads=model_config.n_head,
+            key=key,
+            n_embed=model_config.n_embed,
+            n_heads=model_config.n_head,
             rope_theta=model_config.rope_theta,
         )
 
     def __call__(
-        self, x: Float[Array, "n_tokens n_embed"], mask:Optional[Integer[Array, "n_tokens n_tokens"]] = None
+        self,
+        x: Float[Array, "n_tokens n_embed"],
+        mask: Optional[Integer[Array, "n_tokens n_tokens"]] = None,
     ) -> Tuple[Float[Array, "n_tokens n_embed"], Float[Array, "n_tokens n_tokens"]]:
         """
         Args:
@@ -125,25 +129,26 @@ class Block(eqx.Module):
         self.ln_2 = nn.LayerNorm(model_config.n_embed, use_bias=model_config.bias)
         self.mlp = MLP(key=key_mlp, model_config=model_config)
 
-def __call__(self, key, x, mask=None):
-        # 1. Attention Block
-        # We normalize ONLY for the attention calculation
-        normalized_x = jax.vmap(self.ln_1)(x) 
-        output_embeddings, attn = self.attn(normalized_x, mask=mask)
-        
-        # We add the result back to the ORIGINAL, un-normalized x
-        x = x + output_embeddings 
 
-        # 2. MLP Block
-        # We normalize the UPDATED x ONLY for the MLP calculation
-        normalized_x2 = jax.vmap(self.ln_2)(x)
-        mlp_keys = jax.random.split(key, x.shape[0])s        
-        mlp_out = jax.vmap(self.mlp)(mlp_keys, normalized_x2)
-        
-        # Add the MLP result back to the residual highway
-        x = x + mlp_out
-        
-        return x
+def __call__(self, key, x, mask=None):
+    # 1. Attention Block
+    # We normalize ONLY for the attention calculation
+    normalized_x = jax.vmap(self.ln_1)(x)
+    output_embeddings, attn = self.attn(normalized_x, mask=mask)
+
+    # We add the result back to the ORIGINAL, un-normalized x
+    x = x + output_embeddings
+
+    # 2. MLP Block
+    # We normalize the UPDATED x ONLY for the MLP calculation
+    normalized_x2 = jax.vmap(self.ln_2)(x)
+    mlp_keys = jax.random.split(key, x.shape[0])
+    mlp_out = jax.vmap(self.mlp)(mlp_keys, normalized_x2)
+
+    # Add the MLP result back to the residual highway
+    x = x + mlp_out
+
+    return x
 
 
 class Transformer(eqx.Module):
@@ -204,7 +209,7 @@ class GPT(eqx.Module):
         self,
         key: PRNGKeyArray,
         tokens: Integer[Array, "n_tokens"],
-        mask:Optional[Integer[Array, "n_tokens n_tokens"]] = None,
+        mask: Optional[Integer[Array, "n_tokens n_tokens"]] = None,
         inference: bool = False,
     ) -> Float[Array, "n_tokens vocab_size"]:
         x = self.transformer(key, tokens, mask=mask, inference=inference)
@@ -226,7 +231,6 @@ class GPT(eqx.Module):
         temperature=1.0,
         top_k=None,
     ) -> Integer[Array, "n_tokens + max_new_tokens"]:
-
         input_token_len = initial_tokens.shape[0]
         padding = jnp.zeros((max_new_tokens,), dtype=jnp.int32)
         tokens = jnp.concatenate([initial_tokens, padding], axis=-1)
@@ -236,12 +240,14 @@ class GPT(eqx.Module):
             step_key = jax.random.fold_in(key, i)
             model_key, sample_key = jax.random.split(step_key)
 
-            key_mask = jnp.arange(tokens.shape[0]) <= i   # (T,)
+            key_mask = jnp.arange(tokens.shape[0]) <= i  # (T,)
             mask = key_mask[None, :]  # shape (1, T)
 
-            logits = self(model_key, tokens, mask=mask, inference=False) # use inference=False to get all logits
-            logits = logits[i - 1, :] # get the logits for the next token
-            logits = jnp.expand_dims(logits, axis=0) # shape (1, vocab)
+            logits = self(
+                model_key, tokens, mask=mask, inference=False
+            )  # use inference=False to get all logits
+            logits = logits[i - 1, :]  # get the logits for the next token
+            logits = jnp.expand_dims(logits, axis=0)  # shape (1, vocab)
 
             # inference=True → logits shape (1, vocab)
             logits = logits[0] / temperature
@@ -261,7 +267,6 @@ class GPT(eqx.Module):
         tokens, _ = jax.lax.scan(step, tokens, indexes)
 
         return tokens
-
 
     def decode_slow(
         self,

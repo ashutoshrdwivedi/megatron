@@ -27,6 +27,7 @@ Expected API (to be implemented in nanotron/attention.py):
     apply_rope(x_HxSxD: Array[H, S, D], cos_SxDh, sin_SxDh)
         → Array[H, S, D]
 """
+
 import pytest
 import jax
 import jax.numpy as jnp
@@ -42,9 +43,12 @@ def _import_rope():
     """
     try:
         from nanotron.attention import compute_rope_freqs, apply_rope
+
         return compute_rope_freqs, apply_rope
     except ImportError:
-        pytest.skip("RoPE not yet implemented (compute_rope_freqs / apply_rope missing from nanotron/attention.py)")
+        pytest.skip(
+            "RoPE not yet implemented (compute_rope_freqs / apply_rope missing from nanotron/attention.py)"
+        )
 
 
 def test_rope_output_shape():
@@ -56,8 +60,8 @@ def test_rope_output_shape():
     compute_rope_freqs, apply_rope = _import_rope()
     seq_len, n_heads, head_dim = 8, 4, 16
     key = jax.random.PRNGKey(0)
-    x_HxSxD = jax.random.normal(key, (n_heads, seq_len, head_dim))   # (H=4, S=8, D=16)
-    cos_SxDh, sin_SxDh = compute_rope_freqs(seq_len, head_dim)        # Dh = head_dim // 2 = 8
+    x_HxSxD = jax.random.normal(key, (n_heads, seq_len, head_dim))  # (H=4, S=8, D=16)
+    cos_SxDh, sin_SxDh = compute_rope_freqs(seq_len, head_dim)  # Dh = head_dim // 2 = 8
     out_HxSxD = apply_rope(x_HxSxD, cos_SxDh, sin_SxDh)
     assert out_HxSxD.shape == x_HxSxD.shape
 
@@ -75,10 +79,10 @@ def test_rope_norm_preservation():
     compute_rope_freqs, apply_rope = _import_rope()
     seq_len, n_heads, head_dim = 6, 2, 16
     key = jax.random.PRNGKey(1)
-    x_HxSxD = jax.random.normal(key, (n_heads, seq_len, head_dim))   # (H=2, S=6, D=16)
+    x_HxSxD = jax.random.normal(key, (n_heads, seq_len, head_dim))  # (H=2, S=6, D=16)
     cos_SxDh, sin_SxDh = compute_rope_freqs(seq_len, head_dim)
     out_HxSxD = apply_rope(x_HxSxD, cos_SxDh, sin_SxDh)
-    original_norms_HxS = jnp.linalg.norm(x_HxSxD, axis=-1)           # (H, S)
+    original_norms_HxS = jnp.linalg.norm(x_HxSxD, axis=-1)  # (H, S)
     rotated_norms_HxS = jnp.linalg.norm(out_HxSxD, axis=-1)
     assert jnp.allclose(original_norms_HxS, rotated_norms_HxS, atol=1e-5), (
         "RoPE changed vector norms — rotation must be norm-preserving"
@@ -100,10 +104,12 @@ def test_rope_invertible():
     compute_rope_freqs, apply_rope = _import_rope()
     seq_len, n_heads, head_dim = 6, 2, 16
     key = jax.random.PRNGKey(2)
-    x_HxSxD = jax.random.normal(key, (n_heads, seq_len, head_dim))   # (H=2, S=6, D=16)
+    x_HxSxD = jax.random.normal(key, (n_heads, seq_len, head_dim))  # (H=2, S=6, D=16)
     cos_SxDh, sin_SxDh = compute_rope_freqs(seq_len, head_dim)
     rotated_HxSxD = apply_rope(x_HxSxD, cos_SxDh, sin_SxDh)
-    recovered_HxSxD = apply_rope(rotated_HxSxD, cos_SxDh, -sin_SxDh)  # -sin ↔ inverse rotation
+    recovered_HxSxD = apply_rope(
+        rotated_HxSxD, cos_SxDh, -sin_SxDh
+    )  # -sin ↔ inverse rotation
     assert jnp.allclose(x_HxSxD, recovered_HxSxD, atol=1e-5), (
         "RoPE is not invertible — applying rotation then inverse should return original"
     )

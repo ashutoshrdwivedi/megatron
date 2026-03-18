@@ -6,6 +6,7 @@ Focuses on output shapes across three calling modes:
   - inference forward pass (last token only)
   - autoregressive decode  (token-by-token generation)
 """
+
 import jax
 import jax.numpy as jnp
 
@@ -25,7 +26,9 @@ def _small_config() -> GPTConfig:
     n_embed=8     — embedding dimension (must be divisible by n_head)
     dropout=0.0   — disabled so tests are deterministic
     """
-    return GPTConfig(block_size=8, n_layers=1, vocab_size=10, n_head=2, n_embed=8, dropout=0.0)
+    return GPTConfig(
+        block_size=8, n_layers=1, vocab_size=10, n_head=2, n_embed=8, dropout=0.0
+    )
 
 
 def test_gpt_forward_shape():
@@ -38,9 +41,9 @@ def test_gpt_forward_shape():
     """
     key = jax.random.PRNGKey(0)
     gpt = model.GPT(key, _small_config())
-    tokens_S = jnp.array([1, 2, 3, 4])      # (S=4,)
+    tokens_S = jnp.array([1, 2, 3, 4])  # (S=4,)
     logits_SxV = gpt(key, tokens_S)
-    assert logits_SxV.shape == (4, 10)       # (S, V)
+    assert logits_SxV.shape == (4, 10)  # (S, V)
 
 
 def test_gpt_inference_shape():
@@ -53,9 +56,9 @@ def test_gpt_inference_shape():
     """
     key = jax.random.PRNGKey(0)
     gpt = model.GPT(key, _small_config())
-    tokens_S = jnp.array([1, 2, 3])          # (S=3,)
+    tokens_S = jnp.array([1, 2, 3])  # (S=3,)
     logits_SxV = gpt(key, tokens_S, inference=True)
-    assert logits_SxV.shape == (1, 10)        # (1, V) — always 1 token in inference mode
+    assert logits_SxV.shape == (1, 10)  # (1, V) — always 1 token in inference mode
 
 
 def test_gpt_decode_shapes():
@@ -66,7 +69,7 @@ def test_gpt_decode_shapes():
     """
     key = jax.random.PRNGKey(0)
     gpt = model.GPT(key, _small_config())
-    prompt_S = jnp.array([1, 2, 3])          # (S=3,) prompt tokens
+    prompt_S = jnp.array([1, 2, 3])  # (S=3,) prompt tokens
     key, subkey = jax.random.split(key)
     out_S = gpt.decode(subkey, prompt_S, max_new_tokens=2)
-    assert out_S.shape[0] == len(prompt_S) + 2   # 3 prompt + 2 generated = 5
+    assert out_S.shape[0] == len(prompt_S) + 2  # 3 prompt + 2 generated = 5

@@ -1,17 +1,18 @@
+from __future__ import annotations
+
 import dataclasses
 import jax
-import jax.numpy as jnp
 import einops
-import equinox as eqx
-import jax
-import jax.numpy as jnp
-import optax
 import os
+import optax
 
+import equinox as eqx
+import jax.numpy as jnp
 from jaxtyping import Float, Array, PRNGKeyArray
 from pprint import pprint
 from simple_parsing import ArgumentParser
 from typing import Tuple, Any
+
 from . import model, data, config, utils
 
 seed = 42

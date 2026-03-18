@@ -3,10 +3,10 @@ name = "nanotron"
 version = "0.1.0"
 description = "Jax based nano transformers"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12, <3.13"
 dependencies = [
-    "jax[cuda12]",
-    "jaxlib",
+    "jax[cuda12]>=0.4.30",
+    "jaxlib>=0.4.30",
     "datasets",
     "einops",
     "equinox",
@@ -27,5 +27,17 @@ dev = [
 
 [dependency-groups]
 dev = [
+    "pre-commit>=4.2.0",
     "ruff>=0.11.13",
 ]
+
+[tool.ruff.lint]
+# F722/F821: jaxtyping uses string-based shape annotations that ruff cannot parse.
+# These are false positives — the annotations are valid at runtime via jaxtyping.
+ignore = ["F722", "F821"]
+
+[tool.uv]
+# Override cuBLAS to 12.0.x — the system GPU driver is 525.85.12 (CUDA 12.0 max).
+# cuBLAS 12.1+ uses CUDA runtime APIs that require a newer driver; even basic
+# GEMM calls fail at runtime.  This overrides JAX's transitive >=12.1 constraint.
+override-dependencies = ["nvidia-cublas-cu12==12.0.2.224"]

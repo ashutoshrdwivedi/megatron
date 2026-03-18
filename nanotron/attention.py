@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import einops
 import equinox as eqx
 import jax
@@ -13,18 +15,20 @@ def compute_rope_freqs(
     seq_len: int,
     head_dim: int,
     theta: float = 10000.0,
-) -> Tuple[Float[Array, "seq_len head_dim_half"], Float[Array, "seq_len head_dim_half"]]:
+) -> Tuple[
+    Float[Array, "seq_len head_dim_half"], Float[Array, "seq_len head_dim_half"]
+]:
     """
     Precomputes the cosine and sine rotation frequencies for Rotary Position Embeddings (RoPE).
 
-    Conceptually, this function determines the rotation speed for every 2D "dial" (subspace) 
+    Conceptually, this function determines the rotation speed for every 2D "dial" (subspace)
     in the model's attention mechanism. It generates a geometric sequence of frequencies:
-        * Early dimension pairs (i near 0) have high frequencies, acting as fast-spinning 
+        * Early dimension pairs (i near 0) have high frequencies, acting as fast-spinning
           dials that track immediate, local grammar.
-        * Later dimension pairs (i near head_dim // 2) have exponentially lower frequencies, 
+        * Later dimension pairs (i near head_dim // 2) have exponentially lower frequencies,
           acting as slow-spinning dials that track long-distance context.
 
-    The absolute baseline limit of the model's context window is fundamentally tied to when 
+    The absolute baseline limit of the model's context window is fundamentally tied to when
     the slowest dial completes a full 360-degree rotation.
 
     For each sequence position 'm' and dimension pair 'i', the rotation angle is calculated as:
@@ -32,10 +36,10 @@ def compute_rope_freqs(
 
     Args:
         seq_len: The maximum sequence length (number of text positions) to precompute angles for.
-        head_dim: The total number of dimensions in each attention head. Must be an even number 
+        head_dim: The total number of dimensions in each attention head. Must be an even number
             so it can be perfectly split into 2D subspaces.
-        theta: The base frequency constant. The original RoPE paper defaults to 10000.0. 
-            Modifying this value (e.g., increasing to 500000.0) is a common RoPE scaling 
+        theta: The base frequency constant. The original RoPE paper defaults to 10000.0.
+            Modifying this value (e.g., increasing to 500000.0) is a common RoPE scaling
             technique to stretch the context window for longer documents.
 
     Returns:
@@ -47,10 +51,11 @@ def compute_rope_freqs(
     # Dimension indices 0, 1, ..., n_subspaces - 1
     i = jnp.arange(n_subspaces)
     # freqs[i] = 1 / theta^(2i / head_dim) — one frequency per dimension pair
-    freqs = 1.0 / (theta ** (2 * i / head_dim))         # (n_subspaces,)
-    positions = jnp.arange(seq_len)                     # (seq_len,)
-    angles = jnp.outer(positions, freqs)                # (seq_len, n_subspaces)
+    freqs = 1.0 / (theta ** (2 * i / head_dim))  # (n_subspaces,)
+    positions = jnp.arange(seq_len)  # (seq_len,)
+    angles = jnp.outer(positions, freqs)  # (seq_len, n_subspaces)
     return jnp.cos(angles), jnp.sin(angles)
+
 
 def apply_rope(
     x_HxSxD: Float[Array, "n_heads seq_len head_dim"],
@@ -60,15 +65,15 @@ def apply_rope(
     """
     Rotates query or key vectors using precomputed RoPE frequencies.
 
-    Conceptually, RoPE isolates pairs of dimensions into isolated 2D subspaces and 
-    rotates them to encode relative sequence position. Because the rotation only 
-    changes direction and preserves the vector's magnitude, the word's underlying 
+    Conceptually, RoPE isolates pairs of dimensions into isolated 2D subspaces and
+    rotates them to encode relative sequence position. Because the rotation only
+    changes direction and preserves the vector's magnitude, the word's underlying
     semantic meaning remains intact.
 
     Implementation Details:
-    For hardware memory efficiency, this implementation does not pair adjacent 
-    dimensions (e.g., x[0] with x[1]). Instead, it splits the head dimension in 
-    half, pairing x[i] with x[i + head_dim_half]. The neural network naturally 
+    For hardware memory efficiency, this implementation does not pair adjacent
+    dimensions (e.g., x[0] with x[1]). Instead, it splits the head dimension in
+    half, pairing x[i] with x[i + head_dim_half]. The neural network naturally
     learns to encode its 2D features across this split structure during training.
 
     Treating each pair as a complex number (x1 + i*x2), the rotation by angle θ
@@ -81,29 +86,29 @@ def apply_rope(
     broadcast against the full attention tensor.
 
     Args:
-        x_HxSxD: The input query (Q) or key (K) tensor to be rotated. 
+        x_HxSxD: The input query (Q) or key (K) tensor to be rotated.
             Expected shape: (..., n_heads, seq_len, head_dim).
-        cos_SxDh: The precomputed cosine values for the rotation angles. 
+        cos_SxDh: The precomputed cosine values for the rotation angles.
             Expected shape: (..., seq_len, head_dim_half).
-        sin_SxDh: The precomputed sine values for the rotation angles. 
+        sin_SxDh: The precomputed sine values for the rotation angles.
             Expected shape: (..., seq_len, head_dim_half).
 
     Returns:
-        The newly rotated query or key tensor. It maintains the exact same shape 
-        and magnitude as the input tensor `x_HxSxD`, now embedded with positional 
+        The newly rotated query or key tensor. It maintains the exact same shape
+        and magnitude as the input tensor `x_HxSxD`, now embedded with positional
         context. Shape: (..., n_heads, seq_len, head_dim).
     """
     head_dim = x_HxSxD.shape[-1]
-    
+
     # Split the dimensions directly in half for hardware contiguous memory
-    x1 = x_HxSxD[..., : head_dim // 2]                          # (H, S, Dh)
-    x2 = x_HxSxD[..., head_dim // 2 :]                          # (H, S, Dh)
-    
+    x1 = x_HxSxD[..., : head_dim // 2]  # (H, S, Dh)
+    x2 = x_HxSxD[..., head_dim // 2 :]  # (H, S, Dh)
+
     rotated_x1 = x1 * cos_SxDh - x2 * sin_SxDh
     rotated_x2 = x1 * sin_SxDh + x2 * cos_SxDh
-    
+
     # Stitch the halves back together
-    return jnp.concatenate([rotated_x1, rotated_x2], axis=-1)   # (H, S, D)
+    return jnp.concatenate([rotated_x1, rotated_x2], axis=-1)  # (H, S, D)
 
 
 def scaled_dot_product(
@@ -142,7 +147,9 @@ class MultiHeadAttention(eqx.Module):
     qkv_proj: eqx.nn.Linear
     output_proj: eqx.nn.Linear
 
-    def __init__(self, key: PRNGKeyArray, n_embed: int, n_heads: int, rope_theta: float = 10000.0) -> None:
+    def __init__(
+        self, key: PRNGKeyArray, n_embed: int, n_heads: int, rope_theta: float = 10000.0
+    ) -> None:
         self.n_embed = n_embed
         self.n_heads = n_heads
         self.rope_theta = rope_theta

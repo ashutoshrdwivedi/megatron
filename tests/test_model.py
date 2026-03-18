@@ -13,16 +13,14 @@ Plus a golden-file regression test to catch silent numerical changes.
 Note: run with JAX_PLATFORM_NAME=cpu on this shared GPU machine to avoid
 XLA device conflicts with other users.
 """
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import optax
-import pytest
 
 from nanotron import model
 from nanotron.config import GPTConfig
-
-
 
 
 def _small_config() -> GPTConfig:
@@ -34,14 +32,16 @@ def _small_config() -> GPTConfig:
     seconds on CPU but expressive enough that loss can drop significantly.
     dropout=0.0 keeps forward passes deterministic (no stochastic masking).
     """
-    return GPTConfig(block_size=8, n_layers=2, vocab_size=10, n_head=2, n_embed=16, dropout=0.0)
+    return GPTConfig(
+        block_size=8, n_layers=2, vocab_size=10, n_head=2, n_embed=16, dropout=0.0
+    )
 
 
 def _loss_fn(
     gpt: model.GPT,
     key: jax.Array,
-    x_BxS: jax.Array,   # (B, S)  integer token ids
-    y_BxS: jax.Array,   # (B, S)  next-token targets — x shifted left by one
+    x_BxS: jax.Array,  # (B, S)  integer token ids
+    y_BxS: jax.Array,  # (B, S)  next-token targets — x shifted left by one
     vocab_size: int,
 ) -> jax.Array:
     """
@@ -54,10 +54,10 @@ def _loss_fn(
 
     This mirrors what the real training loop does in nanotron/train.py.
     """
-    keys_B = jax.random.split(key, x_BxS.shape[0])         # one key per batch element
+    keys_B = jax.random.split(key, x_BxS.shape[0])  # one key per batch element
     logits_BxSxV = jax.vmap(gpt, in_axes=(0, 0))(keys_B, x_BxS)
-    logits_BSxV = logits_BxSxV.reshape(-1, vocab_size)      # (B*S, V)
-    y_BS = y_BxS.reshape(-1)                                 # (B*S,)
+    logits_BSxV = logits_BxSxV.reshape(-1, vocab_size)  # (B*S, V)
+    y_BS = y_BxS.reshape(-1)  # (B*S,)
     return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits_BSxV, y_BS))
 
 
@@ -69,7 +69,7 @@ def test_loss_is_finite():
     key = jax.random.PRNGKey(0)
     cfg = _small_config()
     gpt = model.GPT(key, cfg)
-    x_BxS = jnp.array([[1, 2, 3, 4, 5, 6, 7, 0]])   # (B=1, S=8)
+    x_BxS = jnp.array([[1, 2, 3, 4, 5, 6, 7, 0]])  # (B=1, S=8)
     y_BxS = jnp.array([[2, 3, 4, 5, 6, 7, 0, 1]])
     loss = _loss_fn(gpt, key, x_BxS, y_BxS, cfg.vocab_size)
     assert jnp.isfinite(loss), f"Loss is not finite: {loss}"
@@ -89,7 +89,9 @@ def test_no_nan_gradients():
     key = jax.random.PRNGKey(0)
     cfg = _small_config()
     gpt = model.GPT(key, cfg)
-    x_BxS = jnp.array([[1, 2, 3, 4, 5, 6, 7, 0], [2, 3, 4, 5, 6, 7, 0, 1]])  # (B=2, S=8)
+    x_BxS = jnp.array(
+        [[1, 2, 3, 4, 5, 6, 7, 0], [2, 3, 4, 5, 6, 7, 0, 1]]
+    )  # (B=2, S=8)
     y_BxS = jnp.array([[2, 3, 4, 5, 6, 7, 0, 1], [3, 4, 5, 6, 7, 0, 1, 2]])
 
     grad_fn = eqx.filter_value_and_grad(_loss_fn)
@@ -119,7 +121,9 @@ def test_overfit_single_batch():
 
     # Two short sequences where y is x shifted left by one — the standard
     # next-token prediction objective.
-    x_BxS = jnp.array([[1, 2, 3, 4, 5, 6, 7, 0], [2, 3, 4, 5, 6, 7, 0, 1]])  # (B=2, S=8)
+    x_BxS = jnp.array(
+        [[1, 2, 3, 4, 5, 6, 7, 0], [2, 3, 4, 5, 6, 7, 0, 1]]
+    )  # (B=2, S=8)
     y_BxS = jnp.array([[2, 3, 4, 5, 6, 7, 0, 1], [3, 4, 5, 6, 7, 0, 1, 2]])
 
     optimizer = optax.adam(1e-2)
@@ -176,11 +180,11 @@ def test_golden_logits():
       Silent numerical regressions — e.g. a refactor that changes output values
       without breaking any shape assertions.
     """
-    key = jax.random.PRNGKey(42)   # fixed seed — must match the snippet above
+    key = jax.random.PRNGKey(42)  # fixed seed — must match the snippet above
     cfg = _small_config()
     gpt = model.GPT(key, cfg)
-    tokens_S = jnp.array([1, 2, 3, 4])   # (S=4,)
-    logits_SxV = gpt(key, tokens_S)       # (S, V)
+    tokens_S = jnp.array([1, 2, 3, 4])  # (S=4,)
+    logits_SxV = gpt(key, tokens_S)  # (S, V)
 
     # Three independent checksums reduce the chance that cancelling shifts go undetected.
     actual_sum = round(float(jnp.sum(logits_SxV)), 4)
@@ -189,4 +193,4 @@ def test_golden_logits():
 
     assert actual_sum == -9.9176, f"logits sum changed: {actual_sum} (expected -9.9176)"
     assert actual_min == -1.4068, f"logits min changed: {actual_min} (expected -1.4068)"
-    assert actual_max ==  0.6481, f"logits max changed: {actual_max} (expected  0.6481)"
+    assert actual_max == 0.6481, f"logits max changed: {actual_max} (expected  0.6481)"

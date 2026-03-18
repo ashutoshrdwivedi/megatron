@@ -1,15 +1,16 @@
-import dataclasses
+from __future__ import annotations
 import equinox as eqx
 import os
+import pickle
 import jax
-import jax.numpy as jnp
 import typer
-import pickle  # Added import, ensure it's here
+
+import jax.numpy as jnp
 from jaxtyping import Integer, Array
 
 from typing_extensions import Annotated
 from typing import Callable, Tuple
-from . import model, config, data
+from . import model, config
 
 print(f"{os.environ['CUDA_VISIBLE_DEVICES']=}")
 
