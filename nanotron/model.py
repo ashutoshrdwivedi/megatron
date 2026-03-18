@@ -129,26 +129,25 @@ class Block(eqx.Module):
         self.ln_2 = nn.LayerNorm(model_config.n_embed, use_bias=model_config.bias)
         self.mlp = MLP(key=key_mlp, model_config=model_config)
 
+    def __call__(self, key, x, mask=None):
+        # 1. Attention Block
+        # We normalize ONLY for the attention calculation
+        normalized_x = jax.vmap(self.ln_1)(x)
+        output_embeddings, attn = self.attn(normalized_x, mask=mask)
 
-def __call__(self, key, x, mask=None):
-    # 1. Attention Block
-    # We normalize ONLY for the attention calculation
-    normalized_x = jax.vmap(self.ln_1)(x)
-    output_embeddings, attn = self.attn(normalized_x, mask=mask)
+        # We add the result back to the ORIGINAL, un-normalized x
+        x = x + output_embeddings
 
-    # We add the result back to the ORIGINAL, un-normalized x
-    x = x + output_embeddings
+        # 2. MLP Block
+        # We normalize the UPDATED x ONLY for the MLP calculation
+        normalized_x2 = jax.vmap(self.ln_2)(x)
+        mlp_keys = jax.random.split(key, x.shape[0])
+        mlp_out = jax.vmap(self.mlp)(mlp_keys, normalized_x2)
 
-    # 2. MLP Block
-    # We normalize the UPDATED x ONLY for the MLP calculation
-    normalized_x2 = jax.vmap(self.ln_2)(x)
-    mlp_keys = jax.random.split(key, x.shape[0])
-    mlp_out = jax.vmap(self.mlp)(mlp_keys, normalized_x2)
+        # Add the MLP result back to the residual highway
+        x = x + mlp_out
 
-    # Add the MLP result back to the residual highway
-    x = x + mlp_out
-
-    return x
+        return x
 
 
 class Transformer(eqx.Module):
