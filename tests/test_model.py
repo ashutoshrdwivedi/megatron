@@ -14,6 +14,8 @@ Note: run with JAX_PLATFORM_NAME=cpu on this shared GPU machine to avoid
 XLA device conflicts with other users.
 """
 
+from typing import Generator, Tuple
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -21,6 +23,7 @@ import optax
 
 from nanotron import model
 from nanotron.config import GPTConfig
+from nanotron.train import get_optimizers, step
 
 
 def _small_config() -> GPTConfig:
@@ -194,3 +197,95 @@ def test_golden_logits():
     assert actual_sum == 2.0373, f"logits sum changed: {actual_sum} (expected 2.0373)"
     assert actual_min == -1.5516, f"logits min changed: {actual_min} (expected -1.5516)"
     assert actual_max == 1.0738, f"logits max changed: {actual_max} (expected  1.0738)"
+
+
+def _synthetic_dataloader(
+    key: jax.Array,
+    batch_size: int,
+    seq_len: int,
+    vocab_size: int,
+) -> Generator[Tuple[jnp.ndarray, jnp.ndarray], None, None]:
+    """
+    Yield random (x, y) token batches without touching any real dataset.
+
+    Generates a fixed corpus of random tokens once, then samples overlapping
+    windows from it — the same strategy as the real dataloader in data.py,
+    but fully in-memory and dependency-free.
+
+    x_BxS: token ids at positions [i .. i+seq_len)
+    y_BxS: token ids at positions [i+1 .. i+seq_len+1)  (next-token targets)
+    """
+    corpus_len = batch_size * seq_len * 4  # large enough to sample from
+    key, corpus_key = jax.random.split(key)
+    corpus = jax.random.randint(
+        corpus_key, (corpus_len,), 0, vocab_size, dtype=jnp.int32
+    )
+
+    while True:
+        key, idx_key = jax.random.split(key)
+        start_indices = jax.random.randint(
+            idx_key, (batch_size,), 0, corpus_len - seq_len - 1
+        )
+        arange_S = jnp.arange(seq_len)
+        idx_BxS = start_indices[:, None] + arange_S[None, :]  # (B, S)
+        x_BxS = jnp.take(corpus, idx_BxS)
+        y_BxS = jnp.take(corpus, idx_BxS + 1)
+        yield x_BxS, y_BxS
+
+
+def test_training_loop():
+    """
+    End-to-end smoke test for the training loop (train.py's `step` function).
+
+    Runs 20 steps on a tiny synthetic in-memory dataset — no real dataset
+    download required.  Verifies two properties:
+
+      1. Every step produces a finite loss (NaN/Inf would indicate a broken
+         forward or backward pass).
+      2. The final loss is lower than the initial loss (the model actually
+         learns something, ruling out disconnected gradients or a broken
+         optimizer).
+
+    Uses `get_optimizers` from train.py so the weight-decay partitioning and
+    gradient clipping paths are exercised, not just the optax primitives.
+
+    Design choices:
+      steps=20  — enough to see a clear loss drop without being slow on CPU
+      lr=1e-2   — aggressive but safe for a 10k-param model
+      B=4, S=8  — minimal batch to keep compile + runtime fast
+    """
+    NUM_STEPS = 20
+    BATCH_SIZE = 4
+    key = jax.random.PRNGKey(7)
+    cfg = _small_config()
+
+    key, model_key = jax.random.split(key)
+    gpt = model.GPT(model_key, cfg)
+
+    model_params = eqx.filter(gpt, eqx.is_inexact_array)
+    optimizer = get_optimizers(
+        model_params,
+        weight_decay=1e-1,
+        learning_rate=1e-2,
+        betas=(0.9, 0.99),
+    )
+    opt_state = optimizer.init(model_params)
+
+    key, data_key = jax.random.split(key)
+    dataloader = _synthetic_dataloader(
+        data_key, BATCH_SIZE, cfg.block_size, cfg.vocab_size
+    )
+
+    losses = []
+    for i in range(NUM_STEPS):
+        key, step_key = jax.random.split(key)
+        batch = next(dataloader)
+        gpt, opt_state, loss = step(step_key, gpt, optimizer, opt_state, batch)
+        loss_val = float(loss)
+        assert jnp.isfinite(loss), f"Non-finite loss at step {i}: {loss_val}"
+        losses.append(loss_val)
+
+    assert losses[-1] < losses[0], (
+        f"Loss did not decrease over {NUM_STEPS} steps: "
+        f"initial={losses[0]:.4f}, final={losses[-1]:.4f}"
+    )
