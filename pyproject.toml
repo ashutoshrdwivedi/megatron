@@ -28,6 +28,7 @@ dev = [
 [dependency-groups]
 dev = [
     "pre-commit>=4.2.0",
+    "pytest>=8.4.0",
     "ruff>=0.11.13",
 ]
 
@@ -37,7 +38,8 @@ dev = [
 ignore = ["F722", "F821"]
 
 [tool.uv]
-# Override cuBLAS to 12.0.x — the system GPU driver is 525.85.12 (CUDA 12.0 max).
-# cuBLAS 12.1+ uses CUDA runtime APIs that require a newer driver; even basic
-# GEMM calls fail at runtime.  This overrides JAX's transitive >=12.1 constraint.
-override-dependencies = ["nvidia-cublas-cu12==12.0.2.224"]
+# Pin cuBLAS to 12.4.x — cuBLAS 12.0 (the jax 0.4.x default) has a cuBLAS bug
+# (CUBLAS_STATUS_INVALID_VALUE) for matrix multiplications with K >= 1024 when
+# mixed with the CUDA 12.9 runtime libraries on this machine.  12.4 resolves
+# this without requiring a newer GPU driver (525.85.12 / CUDA 12.0 is sufficient).
+override-dependencies = ["nvidia-cublas-cu12==12.4.5.8"]
