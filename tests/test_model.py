@@ -191,6 +191,6 @@ def test_golden_logits():
     actual_min = round(float(jnp.min(logits_SxV)), 4)
     actual_max = round(float(jnp.max(logits_SxV)), 4)
 
-    assert actual_sum == 1.3879, f"logits sum changed: {actual_sum} (expected 1.3879)"
-    assert actual_min == -1.3577, f"logits min changed: {actual_min} (expected -1.3577)"
-    assert actual_max == 1.3312, f"logits max changed: {actual_max} (expected  1.3312)"
+    assert actual_sum == 2.0373, f"logits sum changed: {actual_sum} (expected 2.0373)"
+    assert actual_min == -1.5516, f"logits min changed: {actual_min} (expected -1.5516)"
+    assert actual_max == 1.0738, f"logits max changed: {actual_max} (expected  1.0738)"

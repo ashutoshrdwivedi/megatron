@@ -13,6 +13,16 @@ from .config import GPTConfig
 
 class SwiGLU(eqx.Module):
     """
+    SwiGLU activation unit from "GLU Variants Improve Transformer" (Shazeer, 2020).
+
+    Implements: SwiGLU(x) = Swish(x @ W + b) ⊙ (x @ V + c)
+
+    Both W and V project from in_features (n_embed) to out_features (4·n_embed),
+    so this layer simultaneously expands and gates — replacing the plain c_fc linear.
+    The key insight: gating should happen at the expansion step, on the raw embedding,
+    not on an already-expanded intermediate.
+
+    https://arxiv.org/abs/2002.05202 (section 5)
     https://azizbelaweid.substack.com/p/what-is-swiglu-how-to-implement-it
     """
 
@@ -22,41 +32,43 @@ class SwiGLU(eqx.Module):
     c: Float[Array, "out_features"]
 
     def __init__(self, key: PRNGKeyArray, in_features: int, out_features: int) -> None:
-        k1, k2, k3, k4 = jax.random.split(key, 4)
-        # Use proper scaling for weight initialization (Xavier/Glorot uniform)
-        # Scale by sqrt(2 / in_features) for better initialization
+        k1, k2 = jax.random.split(key, 2)
         scale = jnp.sqrt(2.0 / in_features)
         self.W = jax.random.normal(k1, (in_features, out_features)) * scale
         self.V = jax.random.normal(k2, (in_features, out_features)) * scale
-        # Initialize biases to zero for better training stability
         self.b = jnp.zeros((out_features,))
         self.c = jnp.zeros((out_features,))
 
-    def __call__(
-        self, x: Float[Array, "... in_features"]
-    ) -> Float[Array, "... out_features"]:
+    def __call__(self, x: Float[Array, "in_features"]) -> Float[Array, "out_features"]:
         return jax.nn.swish(jnp.dot(x, self.W) + self.b) * (jnp.dot(x, self.V) + self.c)
 
 
 class MLP(eqx.Module):
-    c_fc: nn.Linear
+    """
+    FFN block using SwiGLU activation.
+
+    Pipeline: SwiGLU(n_embed → 4·n_embed) → Linear(4·n_embed → n_embed) → Dropout
+
+    SwiGLU replaces the traditional c_fc + activation pattern. Two parallel weight
+    matrices W and V (each n_embed × 4·n_embed) project and gate in one step:
+        h = Swish(x @ W) ⊙ (x @ V)
+    Then c_proj contracts back to n_embed.
+
+    Parameter count per layer: 2 × (n_embed × 4·n_embed) + (4·n_embed × n_embed)
+                              = 3 × n_embed × 4·n_embed   (same as standard FFN)
+    """
+
     swiglu: SwiGLU
     c_proj: nn.Linear
     dropout: nn.Dropout
 
     def __init__(self, key: PRNGKeyArray, model_config: GPTConfig) -> None:
-        key_fc, key_swiglu, key_proj, key_dropout = jax.random.split(key, 4)
+        key_swiglu, key_proj = jax.random.split(key, 2)
 
-        self.c_fc = nn.Linear(
-            key=key_fc,
-            in_features=model_config.n_embed,
-            out_features=4 * model_config.n_embed,
-            use_bias=model_config.bias,
-        )
-
+        # W and V are each (n_embed, 4·n_embed) — expands and gates simultaneously
         self.swiglu = SwiGLU(
             key=key_swiglu,
-            in_features=4 * model_config.n_embed,
+            in_features=model_config.n_embed,
             out_features=4 * model_config.n_embed,
         )
 
@@ -72,12 +84,11 @@ class MLP(eqx.Module):
     def __call__(
         self,
         key: PRNGKeyArray,
-        x: Float[Array, "n_tokens n_embed"],
+        x: Float[Array, "n_embed"],
         inference: bool = False,
-    ) -> Float[Array, "n_tokens n_embed"]:
-        x = self.c_fc(x)
-        x = self.swiglu(x)
-        x = self.c_proj(x)
+    ) -> Float[Array, "n_embed"]:
+        x = self.swiglu(x)  # n_embed → 4·n_embed
+        x = self.c_proj(x)  # 4·n_embed → n_embed
         x = self.dropout(x, key=key, inference=inference)
         return x
 
