@@ -114,3 +114,86 @@ def test_multi_head_attention_output_shape():
     values_SxE, attn_HxSxS = mha(x_SxE)
     assert values_SxE.shape == (seq_len, n_embed)  # (S, E)
     assert attn_HxSxS.shape == (n_heads, seq_len, seq_len)  # (H, S, S)
+
+
+# ── Grouped Query Attention (GQA) ─────────────────────────────────────────────
+
+
+def test_gqa_output_shape():
+    """
+    GQA must return the same shapes as MHA:
+      - output embeddings: (S, E)  — identical to input shape
+      - attention weights: (Hq, S, S)  — one weight matrix per query head
+
+    Using 4 query heads and 2 KV heads (group size = 2).
+    """
+    key = jax.random.PRNGKey(0)
+    seq_len, n_embed, n_heads, n_kv_heads = 5, 8, 4, 2
+    gqa = attention.GroupedQueryAttention(
+        key, n_embed=n_embed, n_heads=n_heads, n_kv_heads=n_kv_heads
+    )
+    x_SxE = jax.random.normal(key, (seq_len, n_embed))
+    out_SxE, attn_HxSxS = gqa(x_SxE)
+    assert out_SxE.shape == (seq_len, n_embed)
+    assert attn_HxSxS.shape == (n_heads, seq_len, seq_len)
+
+
+def test_gqa_attention_rows_sum_to_one():
+    """
+    Each query's attention weights over all keys must sum to 1.0 (softmax normalisation).
+    Checked across all query heads.
+    """
+    key = jax.random.PRNGKey(1)
+    gqa = attention.GroupedQueryAttention(key, n_embed=8, n_heads=4, n_kv_heads=2)
+    x_SxE = jax.random.normal(key, (6, 8))
+    _, attn_HxSxS = gqa(x_SxE)
+    row_sums = attn_HxSxS.sum(axis=-1)  # (Hq, S)
+    assert jnp.allclose(row_sums, jnp.ones_like(row_sums), atol=1e-5)
+
+
+def test_gqa_causal_mask():
+    """
+    With a lower-triangular causal mask, every entry in the upper triangle of
+    each query head's attention matrix must be exactly 0.
+    """
+    key = jax.random.PRNGKey(2)
+    seq_len, n_embed, n_heads, n_kv_heads = 6, 8, 4, 2
+    gqa = attention.GroupedQueryAttention(
+        key, n_embed=n_embed, n_heads=n_heads, n_kv_heads=n_kv_heads
+    )
+    x_SxE = jax.random.normal(key, (seq_len, n_embed))
+    causal_mask_SxS = jnp.tril(jnp.ones((seq_len, seq_len), dtype=bool))
+    _, attn_HxSxS = gqa(x_SxE, mask=causal_mask_SxS)
+    upper_SxS = ~causal_mask_SxS
+    assert jnp.all(attn_HxSxS[:, upper_SxS] == 0.0), (
+        "Future tokens have non-zero attention weight in GQA"
+    )
+
+
+def test_gqa_deterministic():
+    """
+    GQA has no stochastic ops, so identical inputs must produce bit-identical outputs.
+    """
+    key = jax.random.PRNGKey(3)
+    gqa = attention.GroupedQueryAttention(key, n_embed=8, n_heads=4, n_kv_heads=2)
+    x_SxE = jax.random.normal(key, (4, 8))
+    out1, attn1 = gqa(x_SxE)
+    out2, attn2 = gqa(x_SxE)
+    assert jnp.allclose(out1, out2)
+    assert jnp.allclose(attn1, attn2)
+
+
+def test_gqa_mqa_is_special_case():
+    """
+    Multi-Query Attention (MQA) is GQA with n_kv_heads=1. All query heads share
+    a single K and V head. Output shape must still be (S, E) with attention (Hq, S, S).
+    """
+    key = jax.random.PRNGKey(4)
+    seq_len, n_embed, n_heads = 5, 8, 4
+    mqa = attention.GroupedQueryAttention(
+        key, n_embed=n_embed, n_heads=n_heads, n_kv_heads=1
+    )
+    x_SxE = jax.random.normal(key, (seq_len, n_embed))
+    out_SxE, attn_HxSxS = mqa(x_SxE)
+    assert out_SxE.shape == (seq_len, n_embed)
+    assert attn_HxSxS.shape == (n_heads, seq_len, seq_len)

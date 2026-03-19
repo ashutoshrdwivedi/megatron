@@ -138,6 +138,123 @@ def expand_mask(mask: Array) -> Array:
     return mask
 
 
+class GroupedQueryAttention(eqx.Module):
+    """
+    Grouped Query Attention (GQA) from "GQA: Training Generalized Multi-Query
+    Transformer Models from Multi-Head Checkpoints" (Ainslie et al., 2023).
+    https://arxiv.org/abs/2305.13245
+
+    In standard MHA every query head owns its own K and V head, leading to
+    memory bandwidth that scales with n_heads. GQA reduces that cost by letting
+    a *group* of query heads share a single K/V head, so bandwidth scales with
+    the much smaller n_kv_heads instead.
+
+    Special cases that collapse to known variants:
+        n_kv_heads == n_heads  →  standard Multi-Head Attention (MHA)
+        n_kv_heads == 1        →  Multi-Query Attention (MQA)
+
+    Projection layout:
+        Q  projection:  n_embed → n_heads    × head_dim
+        KV projection:  n_embed → n_kv_heads × head_dim  (×2 for K and V)
+
+    After projection, each KV head is *repeated* (not re-projected) n_groups
+    times so that every query head has a matching K and V to attend against.
+    n_groups = n_heads // n_kv_heads.
+    """
+
+    n_embed: int
+    n_heads: int
+    n_kv_heads: int
+    rope_theta: float
+    q_proj: eqx.nn.Linear
+    kv_proj: eqx.nn.Linear
+    output_proj: eqx.nn.Linear
+
+    def __init__(
+        self,
+        key: PRNGKeyArray,
+        n_embed: int,
+        n_heads: int,
+        n_kv_heads: int,
+        rope_theta: float = 10000.0,
+    ) -> None:
+        assert n_heads % n_kv_heads == 0, (
+            f"n_heads ({n_heads}) must be divisible by n_kv_heads ({n_kv_heads})"
+        )
+        self.n_embed = n_embed
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.rope_theta = rope_theta
+
+        head_dim = n_embed // n_heads
+        key_q, key_kv, key_proj = jax.random.split(key, 3)
+
+        # Queries use all n_heads; keys and values share n_kv_heads
+        self.q_proj = eqx.nn.Linear(
+            in_features=n_embed,
+            out_features=n_heads * head_dim,
+            use_bias=True,
+            key=key_q,
+        )
+        self.kv_proj = eqx.nn.Linear(
+            in_features=n_embed,
+            out_features=2 * n_kv_heads * head_dim,
+            use_bias=True,
+            key=key_kv,
+        )
+        self.output_proj = eqx.nn.Linear(
+            in_features=n_embed,
+            out_features=n_embed,
+            use_bias=True,
+            key=key_proj,
+        )
+
+    def __call__(
+        self,
+        x_SxE: Float[Array, "seq_len n_embed"],
+        mask: Optional[Array] = None,
+    ) -> Tuple[
+        Float[Array, "seq_len n_embed"],
+        Float[Array, "n_heads seq_len seq_len"],
+    ]:
+        seq_len, _ = x_SxE.shape
+        head_dim = self.n_embed // self.n_heads
+        n_groups = self.n_heads // self.n_kv_heads
+
+        # ── Project ──────────────────────────────────────────────────────────
+        q_SxHD = jax.vmap(self.q_proj)(x_SxE)  # (S, n_heads * head_dim)
+        kv_SxKD = jax.vmap(self.kv_proj)(x_SxE)  # (S, 2 * n_kv_heads * head_dim)
+
+        # ── Reshape into per-head tensors ─────────────────────────────────────
+        q_HxSxD = einops.rearrange(
+            q_SxHD, "s (h d) -> h s d", h=self.n_heads, d=head_dim
+        )  # (n_heads, S, D)
+
+        # kv=2 splits the last axis evenly into K and V
+        kv_2xKVHxSxD = einops.rearrange(
+            kv_SxKD, "s (kv h d) -> kv h s d", kv=2, h=self.n_kv_heads, d=head_dim
+        )  # (2, n_kv_heads, S, D)
+        k_KVHxSxD, v_KVHxSxD = kv_2xKVHxSxD[0], kv_2xKVHxSxD[1]
+
+        # ── Expand each KV head to cover its group of query heads ─────────────
+        # (n_kv_heads, S, D) → (n_heads, S, D)  by repeating n_groups times
+        k_HxSxD = jnp.repeat(k_KVHxSxD, n_groups, axis=0)
+        v_HxSxD = jnp.repeat(v_KVHxSxD, n_groups, axis=0)
+
+        # ── Apply RoPE to queries and keys (not values) ───────────────────────
+        cos_SxDh, sin_SxDh = compute_rope_freqs(seq_len, head_dim, self.rope_theta)
+        q_HxSxD = apply_rope(q_HxSxD, cos_SxDh, sin_SxDh)
+        k_HxSxD = apply_rope(k_HxSxD, cos_SxDh, sin_SxDh)
+
+        # ── Attention + merge heads ───────────────────────────────────────────
+        values_HxSxD, attention_HxSxS = scaled_dot_product(
+            q_HxSxD, k_HxSxD, v_HxSxD, mask=mask
+        )
+        values_SxE = einops.rearrange(values_HxSxD, "h s d -> s (h d)", h=self.n_heads)
+        output_SxE = jax.vmap(self.output_proj)(values_SxE)
+        return output_SxE, attention_HxSxS
+
+
 class MultiHeadAttention(eqx.Module):
     """Given initial embeddings, get q k v, apply attention, and output projection"""
 

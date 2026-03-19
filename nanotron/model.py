@@ -94,15 +94,28 @@ class MLP(eqx.Module):
 
 
 class CasualSelfAttention(eqx.Module):
-    mha: attention.MultiHeadAttention
+    # Holds either a MultiHeadAttention or GroupedQueryAttention instance.
+    # Swap by setting n_kv_heads in GPTConfig:
+    #   None (default) → MultiHeadAttention
+    #   int            → GroupedQueryAttention  (n_kv_heads=1 gives MQA)
+    mha: attention.MultiHeadAttention | attention.GroupedQueryAttention
 
     def __init__(self, key: PRNGKeyArray, model_config: GPTConfig) -> None:
-        self.mha = attention.MultiHeadAttention(
-            key=key,
-            n_embed=model_config.n_embed,
-            n_heads=model_config.n_head,
-            rope_theta=model_config.rope_theta,
-        )
+        if model_config.n_kv_heads is None:
+            self.mha = attention.MultiHeadAttention(
+                key=key,
+                n_embed=model_config.n_embed,
+                n_heads=model_config.n_head,
+                rope_theta=model_config.rope_theta,
+            )
+        else:
+            self.mha = attention.GroupedQueryAttention(
+                key=key,
+                n_embed=model_config.n_embed,
+                n_heads=model_config.n_head,
+                n_kv_heads=model_config.n_kv_heads,
+                rope_theta=model_config.rope_theta,
+            )
 
     def __call__(
         self,

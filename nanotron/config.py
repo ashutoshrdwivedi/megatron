@@ -1,6 +1,7 @@
 import os
 
 from dataclasses import dataclass
+from typing import Optional
 
 print(f"{os.environ['OUT_DIR']=}")
 
@@ -17,6 +18,11 @@ class GPTConfig:
     dropout: float = 0.2
     bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     rope_theta: float = 10000.0  # base frequency for rotary position embeddings
+    # Number of key/value heads for Grouped Query Attention.
+    # None → standard Multi-Head Attention (n_kv_heads == n_head).
+    # 1    → Multi-Query Attention (all query heads share one KV head).
+    # Default: 2 KV heads for 6 query heads → 3 query heads per KV group.
+    n_kv_heads: Optional[int] = 2
 
 
 @dataclass

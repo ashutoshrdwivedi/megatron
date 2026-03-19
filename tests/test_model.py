@@ -166,8 +166,7 @@ def test_golden_logits():
       If you make an intentional architectural change, re-run the snippet below
       to get the new values and update the three expected constants here:
 
-        JAX_PLATFORM_NAME=cpu python -c "
-        import os; os.environ['OUT_DIR'] = '/tmp/test'
+        JAX_PLATFORMS=cpu OUT_DIR=/tmp/test python -c "
         import jax, jax.numpy as jnp
         from nanotron import model
         from nanotron.config import GPTConfig
@@ -194,9 +193,9 @@ def test_golden_logits():
     actual_min = round(float(jnp.min(logits_SxV)), 4)
     actual_max = round(float(jnp.max(logits_SxV)), 4)
 
-    assert actual_sum == 2.0373, f"logits sum changed: {actual_sum} (expected 2.0373)"
-    assert actual_min == -1.5516, f"logits min changed: {actual_min} (expected -1.5516)"
-    assert actual_max == 1.0738, f"logits max changed: {actual_max} (expected  1.0738)"
+    assert actual_sum == 2.4208, f"logits sum changed: {actual_sum} (expected 2.4208)"
+    assert actual_min == -1.1937, f"logits min changed: {actual_min} (expected -1.1937)"
+    assert actual_max == 1.2504, f"logits max changed: {actual_max} (expected  1.2504)"
 
 
 def _synthetic_dataloader(
