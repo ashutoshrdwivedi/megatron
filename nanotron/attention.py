@@ -5,16 +5,54 @@ import equinox as eqx
 import jax
 import math
 
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 from jax import numpy as jnp
 from jaxtyping import Array, Float, PRNGKeyArray
+
+
+class KVCache(NamedTuple):
+    """
+    Pre-allocated cache of Key and Value tensors for a single attention layer.
+
+    The fundamental bottleneck in autoregressive generation is that every new
+    token requires re-computing K and V for *all* past tokens.  KV caching
+    solves this by projecting each token's K and V once and storing them; on
+    every subsequent step we just look them up.
+
+    Complexity impact for generating T new tokens after a prompt of length P:
+        Without cache:  O((P + T)²)  — full attention is recomputed at each step
+        With    cache:  O(P² + T·P)  — quadratic only in the prompt (prefill),
+                                       then linear in new tokens (decode)
+
+    Layout
+    ------
+    Both arrays are *pre-allocated* to `max_seq_len` and zero-initialised.
+    Only positions [0 .. cur_pos) are ever populated; the rest stay zero.
+    A position-aware causal mask prevents attention from bleeding into those
+    uninitialised zero slots.
+
+        k_KVHxSxD : (n_kv_heads, max_seq_len, head_dim)  — cached key vectors
+        v_KVHxSxD : (n_kv_heads, max_seq_len, head_dim)  — cached value vectors
+
+    n_kv_heads equals n_heads for MHA, but can be much smaller for GQA/MQA —
+    which is the whole memory-bandwidth motivation for grouped query attention.
+    The cache always stores the *un-expanded* KV heads (before the GQA repeat).
+
+    NamedTuple is used (over a plain dataclass) because JAX automatically
+    treats NamedTuples as PyTrees, making the cache compatible with jit and
+    lax.scan without any extra registration boilerplate.
+    """
+
+    k_KVHxSxD: Float[Array, "n_kv_heads max_seq_len head_dim"]
+    v_KVHxSxD: Float[Array, "n_kv_heads max_seq_len head_dim"]
 
 
 def compute_rope_freqs(
     seq_len: int,
     head_dim: int,
     theta: float = 10000.0,
+    start_pos: int = 0,
 ) -> Tuple[
     Float[Array, "seq_len head_dim_half"], Float[Array, "seq_len head_dim_half"]
 ]:
@@ -34,25 +72,30 @@ def compute_rope_freqs(
     For each sequence position 'm' and dimension pair 'i', the rotation angle is calculated as:
         angle[m, i] = m * (1 / (theta ^ (2i / head_dim)))
 
+    KV-cache note: during autoregressive decoding, new tokens arrive at absolute positions
+    [start_pos, start_pos+1, ..., start_pos+seq_len-1] rather than always starting at 0.
+    Passing start_pos ensures the Q and K vectors for those tokens are rotated by the correct
+    absolute angles, so that Q·K dot products still encode the right *relative* distance.
+
     Args:
-        seq_len: The maximum sequence length (number of text positions) to precompute angles for.
-        head_dim: The total number of dimensions in each attention head. Must be an even number
-            so it can be perfectly split into 2D subspaces.
-        theta: The base frequency constant. The original RoPE paper defaults to 10000.0.
-            Modifying this value (e.g., increasing to 500000.0) is a common RoPE scaling
-            technique to stretch the context window for longer documents.
+        seq_len:   Number of positions to generate angles for.
+        head_dim:  Total dimensions per attention head (must be even).
+        theta:     Base frequency constant (default 10000.0 from the original paper).
+        start_pos: Absolute position of the first token in this window (default 0).
+                   During normal training this is always 0.  During KV-cache decoding
+                   it equals the number of tokens already in the cache.
 
     Returns:
         A tuple containing two arrays:
-        - cos_SxDh: Precomputed cosine values for the rotation angles. Shape: (seq_len, head_dim // 2).
-        - sin_SxDh: Precomputed sine values for the rotation angles. Shape: (seq_len, head_dim // 2).
+        - cos_SxDh: Precomputed cosine values. Shape: (seq_len, head_dim // 2).
+        - sin_SxDh: Precomputed sine values.  Shape: (seq_len, head_dim // 2).
     """
     n_subspaces = head_dim // 2
     # Dimension indices 0, 1, ..., n_subspaces - 1
     i = jnp.arange(n_subspaces)
     # freqs[i] = 1 / theta^(2i / head_dim) — one frequency per dimension pair
     freqs = 1.0 / (theta ** (2 * i / head_dim))  # (n_subspaces,)
-    positions = jnp.arange(seq_len)  # (seq_len,)
+    positions = jnp.arange(start_pos, start_pos + seq_len)  # (seq_len,)
     angles = jnp.outer(positions, freqs)  # (seq_len, n_subspaces)
     return jnp.cos(angles), jnp.sin(angles)
 
@@ -254,6 +297,130 @@ class GroupedQueryAttention(eqx.Module):
         output_SxE = jax.vmap(self.output_proj)(values_SxE)
         return output_SxE, attention_HxSxS
 
+    def forward_with_cache(
+        self,
+        x_SxE: Float[Array, "seq_len n_embed"],
+        cache: KVCache,
+        start_pos: int,
+    ) -> Tuple[Float[Array, "seq_len n_embed"], KVCache]:
+        """
+        Incremental attention forward pass using a KV cache.
+
+        The two phases of cached generation
+        ------------------------------------
+        Prefill  (start_pos=0, seq_len=prompt_length):
+            Process all prompt tokens at once — identical to a normal forward
+            pass with a causal mask, but also populates the cache as a side
+            effect.  Token i attends to tokens 0..i (causality preserved).
+
+        Decode  (start_pos=prompt_length+t, seq_len=1):
+            Process a single newly-generated token at step t.  The query is
+            just that one token's projected embedding; the keys and values span
+            the entire context (prompt + all t previously generated tokens)
+            and are read directly from the cache.
+            Cost per step: O(context_len) instead of O(context_len²).
+
+        Cache write
+        -----------
+        New K and V are inserted at positions [start_pos .. start_pos+S) using
+        jax.lax.dynamic_update_slice.  Unlike Python/NumPy slice assignment,
+        dynamic_update_slice accepts *traced* (runtime-computed) indices and is
+        safe inside jit and lax.scan.
+
+        Causal mask
+        -----------
+        The mask has shape (S, max_seq_len) — asymmetric because the query
+        window S is short (1 during decode) while keys span the full cache.
+            mask[i, j] = True  iff  (start_pos + i) >= j
+
+        Two properties fall out automatically:
+          1. Causality — future tokens are blocked (j > start_pos+i → False).
+          2. Uninitialised slots — positions j >= start_pos+S can never satisfy
+             j <= start_pos+(S-1), so they are always masked out.  Their zero
+             K/V values never contribute to the output.
+
+        Args:
+            x_SxE:     Input embeddings for the current window.
+                       Shape (seq_len, n_embed).  seq_len=1 during decode.
+            cache:     KVCache holding pre-allocated k/v buffers for this layer.
+            start_pos: Absolute position of x_SxE[0] in the full sequence.
+                       0 during prefill; increments by seq_len each decode step.
+
+        Returns:
+            output_SxE: Updated token embeddings, shape (seq_len, n_embed).
+            new_cache:  KVCache with current window's k/v written in.
+        """
+        seq_len, _ = x_SxE.shape
+        head_dim = self.n_embed // self.n_heads
+        n_groups = self.n_heads // self.n_kv_heads
+        max_seq_len = cache.k_KVHxSxD.shape[1]
+
+        # ── Project ──────────────────────────────────────────────────────────
+        q_SxHD = jax.vmap(self.q_proj)(x_SxE)  # (S, n_heads * head_dim)
+        kv_SxKD = jax.vmap(self.kv_proj)(x_SxE)  # (S, 2 * n_kv_heads * head_dim)
+
+        # ── Reshape into per-head tensors ─────────────────────────────────────
+        q_HxSxD = einops.rearrange(
+            q_SxHD, "s (h d) -> h s d", h=self.n_heads, d=head_dim
+        )  # (n_heads, S, D)
+
+        kv_2xKVHxSxD = einops.rearrange(
+            kv_SxKD, "s (kv h d) -> kv h s d", kv=2, h=self.n_kv_heads, d=head_dim
+        )  # (2, n_kv_heads, S, D)
+        k_KVHxSxD, v_KVHxSxD = kv_2xKVHxSxD[0], kv_2xKVHxSxD[1]
+
+        # ── Apply RoPE at the correct absolute positions ──────────────────────
+        # During training, positions are always 0..S-1 (start_pos=0).
+        # During KV-cache decoding, new tokens arrive at [start_pos .. start_pos+S-1].
+        # Using the wrong positions here would corrupt the Q·K relative distances
+        # and silently degrade model quality without any shape errors.
+        cos_SxDh, sin_SxDh = compute_rope_freqs(
+            seq_len, head_dim, self.rope_theta, start_pos=start_pos
+        )
+        q_HxSxD = apply_rope(q_HxSxD, cos_SxDh, sin_SxDh)
+        k_KVHxSxD = apply_rope(k_KVHxSxD, cos_SxDh, sin_SxDh)
+
+        # ── Write new K and V into the cache ──────────────────────────────────
+        # Start indices (0, start_pos, 0) mean: write at all KV-head rows,
+        # starting at column start_pos, all head-dim positions.
+        #
+        #   Before write:  cache.k[:, :start_pos,          :] holds history
+        #   After  write:  new_k  [:, :start_pos+seq_len,  :] holds history + window
+        new_k = jax.lax.dynamic_update_slice(
+            cache.k_KVHxSxD, k_KVHxSxD, (0, start_pos, 0)
+        )  # (n_kv_heads, max_seq_len, D)
+        new_v = jax.lax.dynamic_update_slice(
+            cache.v_KVHxSxD, v_KVHxSxD, (0, start_pos, 0)
+        )
+        new_cache = KVCache(k_KVHxSxD=new_k, v_KVHxSxD=new_v)
+
+        # ── Expand KV heads to match query heads (GQA repeat) ─────────────────
+        # We repeat over the *full* cache, not just the newly-written window.
+        # This is the GQA head-expansion step applied to the entire history.
+        k_HxMaxSxD = jnp.repeat(new_k, n_groups, axis=0)  # (n_heads, max_seq_len, D)
+        v_HxMaxSxD = jnp.repeat(new_v, n_groups, axis=0)
+
+        # ── Build the asymmetric causal mask ──────────────────────────────────
+        # Q shape: (n_heads, S,           D) — only the current window
+        # K shape: (n_heads, max_seq_len, D) — full cache
+        # mask[i, j] = True iff query at absolute position (start_pos+i) may
+        #              attend to key at absolute position j.
+        q_pos_S = jnp.arange(start_pos, start_pos + seq_len)  # (S,)
+        k_pos_MaxS = jnp.arange(max_seq_len)  # (max_seq_len,)
+        causal_mask_SxMaxS = q_pos_S[:, None] >= k_pos_MaxS[None, :]  # (S, max_seq_len)
+
+        # ── Attend over the full cache + merge heads ──────────────────────────
+        # scaled_dot_product handles asymmetric (Sq, Sk) shapes automatically.
+        # Uninitialised cache slots (positions >= start_pos+seq_len) are always
+        # masked out, so their zero K/V values never affect the output.
+        values_HxSxD, _ = scaled_dot_product(
+            q_HxSxD, k_HxMaxSxD, v_HxMaxSxD, mask=causal_mask_SxMaxS
+        )
+        values_SxE = einops.rearrange(values_HxSxD, "h s d -> s (h d)", h=self.n_heads)
+        output_SxE = jax.vmap(self.output_proj)(values_SxE)
+
+        return output_SxE, new_cache
+
 
 class MultiHeadAttention(eqx.Module):
     """Given initial embeddings, get q k v, apply attention, and output projection"""
@@ -336,3 +503,81 @@ class MultiHeadAttention(eqx.Module):
         )
         output_embeddings = jax.vmap(self.output_proj)(values)
         return output_embeddings, attention
+
+    def forward_with_cache(
+        self,
+        x_SxE: Float[Array, "seq_len n_embed"],
+        cache: KVCache,
+        start_pos: int,
+    ) -> Tuple[Float[Array, "seq_len n_embed"], KVCache]:
+        """
+        Incremental MHA forward pass using a KV cache.
+
+        MHA is the special case of GQA where n_kv_heads == n_heads, so the
+        K/V cache has shape (n_heads, max_seq_len, head_dim) and no head
+        expansion is needed.  See GroupedQueryAttention.forward_with_cache for
+        a detailed explanation of the prefill/decode flow and masking strategy.
+
+        Args:
+            x_SxE:     Input embeddings, shape (seq_len, n_embed).
+            cache:     KVCache with (n_heads, max_seq_len, head_dim) buffers.
+            start_pos: Absolute position of x_SxE[0] in the full sequence.
+
+        Returns:
+            output_SxE: Updated embeddings, shape (seq_len, n_embed).
+            new_cache:  KVCache with the current window written in.
+        """
+        seq_len, n_embed = x_SxE.shape
+        head_dim = n_embed // self.n_heads
+        max_seq_len = cache.k_KVHxSxD.shape[1]
+
+        # Project to QKV — single matrix, then split
+        qkv_SxD = jax.vmap(self.qkv_proj)(x_SxE)  # (S, 3 * n_embed)
+
+        # Reshape: pack all 3*head_dim dims per head, then array_split into Q/K/V.
+        # This mirrors the layout used in __call__ so the same trained weights apply.
+        reshaped_qkv = einops.rearrange(
+            qkv_SxD,
+            "s (n_heads d) -> n_heads s d",
+            s=seq_len,
+            n_heads=self.n_heads,
+        )  # (n_heads, S, 3 * head_dim)
+        q_HxSxD, k_HxSxD, v_HxSxD = jnp.array_split(reshaped_qkv, 3, axis=-1)
+        # Each: (n_heads, S, head_dim)
+
+        # ── Apply RoPE at the correct absolute positions ──────────────────────
+        cos_SxDh, sin_SxDh = compute_rope_freqs(
+            seq_len, head_dim, self.rope_theta, start_pos=start_pos
+        )
+        q_HxSxD = apply_rope(q_HxSxD, cos_SxDh, sin_SxDh)
+        k_HxSxD = apply_rope(k_HxSxD, cos_SxDh, sin_SxDh)
+
+        # ── Write K and V into the cache ──────────────────────────────────────
+        # For MHA, n_kv_heads == n_heads, so the cache first dim is n_heads.
+        new_k = jax.lax.dynamic_update_slice(
+            cache.k_KVHxSxD, k_HxSxD, (0, start_pos, 0)
+        )  # (n_heads, max_seq_len, head_dim)
+        new_v = jax.lax.dynamic_update_slice(
+            cache.v_KVHxSxD, v_HxSxD, (0, start_pos, 0)
+        )
+        new_cache = KVCache(k_KVHxSxD=new_k, v_KVHxSxD=new_v)
+
+        # ── Build asymmetric causal mask ──────────────────────────────────────
+        q_pos_S = jnp.arange(start_pos, start_pos + seq_len)  # (S,)
+        k_pos_MaxS = jnp.arange(max_seq_len)  # (max_seq_len,)
+        causal_mask_SxMaxS = q_pos_S[:, None] >= k_pos_MaxS[None, :]  # (S, max_seq_len)
+
+        # ── Attend over the full cache ────────────────────────────────────────
+        # new_k / new_v shape: (n_heads, max_seq_len, head_dim)
+        values_HxSxD, _ = scaled_dot_product(
+            q_HxSxD, new_k, new_v, mask=causal_mask_SxMaxS
+        )
+        values_SxE = einops.rearrange(
+            values_HxSxD,
+            "n_heads s d -> s (n_heads d)",
+            n_heads=self.n_heads,
+            s=seq_len,
+        )
+        output_SxE = jax.vmap(self.output_proj)(values_SxE)
+
+        return output_SxE, new_cache

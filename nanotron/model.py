@@ -138,6 +138,29 @@ class CasualSelfAttention(eqx.Module):
             final_mask = causal_mask
         return self.mha(x, mask=final_mask)
 
+    def forward_with_cache(
+        self,
+        x_SxE: Float[Array, "n_tokens n_embed"],
+        cache: attention.KVCache,
+        start_pos: int,
+    ) -> Tuple[Float[Array, "n_tokens n_embed"], attention.KVCache]:
+        """
+        Delegates to the underlying MHA or GQA module's forward_with_cache.
+
+        The causal mask is constructed *inside* forward_with_cache using absolute
+        positions, so no mask-building is needed here — the position-awareness
+        is handled entirely by start_pos.
+
+        Args:
+            x_SxE:     Input embeddings, shape (n_tokens, n_embed).
+            cache:     KV cache for this attention layer.
+            start_pos: Absolute position of x_SxE[0] in the full sequence.
+
+        Returns:
+            Tuple of (output embeddings, updated KV cache).
+        """
+        return self.mha.forward_with_cache(x_SxE, cache, start_pos)
+
 
 class Block(eqx.Module):
     ln_1: nn.LayerNorm
@@ -172,6 +195,47 @@ class Block(eqx.Module):
         x = x + mlp_out
 
         return x
+
+    def forward_with_cache(
+        self,
+        key: PRNGKeyArray,
+        x_SxE: Float[Array, "seq_len n_embed"],
+        cache: attention.KVCache,
+        start_pos: int,
+    ) -> Tuple[Float[Array, "seq_len n_embed"], attention.KVCache]:
+        """
+        Single transformer block forward pass using a KV cache.
+
+        Follows the same pre-norm + residual structure as __call__, with two
+        differences that are appropriate for inference:
+          - Attention uses forward_with_cache (attends over full cache history).
+          - MLP is called with inference=True to disable dropout.
+
+        Args:
+            key:       PRNG key forwarded to MLP (unused when dropout=0).
+            x_SxE:    Input embeddings, shape (seq_len, n_embed).
+            cache:     KV cache for this block's attention layer.
+            start_pos: Absolute position of x_SxE[0] in the sequence.
+
+        Returns:
+            (updated embeddings (seq_len, n_embed), updated KV cache)
+        """
+        # 1. Attention block — pre-norm, residual add
+        normalized_x = jax.vmap(self.ln_1)(x_SxE)
+        attn_out_SxE, new_cache = self.attn.forward_with_cache(
+            normalized_x, cache, start_pos
+        )
+        x_SxE = x_SxE + attn_out_SxE
+
+        # 2. MLP block — pre-norm, residual add, dropout disabled
+        normalized_x2 = jax.vmap(self.ln_2)(x_SxE)
+        mlp_keys = jax.random.split(key, x_SxE.shape[0])
+        mlp_out_SxE = jax.vmap(lambda k, x: self.mlp(k, x, inference=True))(
+            mlp_keys, normalized_x2
+        )
+        x_SxE = x_SxE + mlp_out_SxE
+
+        return x_SxE, new_cache
 
 
 class Transformer(eqx.Module):
@@ -211,6 +275,45 @@ class Transformer(eqx.Module):
             x = block(key, x, mask=mask)
         x = jax.vmap(self.ln_f)(x)
         return x
+
+    def forward_with_cache(
+        self,
+        key: PRNGKeyArray,
+        tokens: Integer[Array, "n_tokens"],
+        caches: List[attention.KVCache],
+        start_pos: int,
+    ) -> Tuple[Float[Array, "n_tokens n_embed"], List[attention.KVCache]]:
+        """
+        Full transformer stack forward pass using per-layer KV caches.
+
+        Differences from __call__:
+          - Embedding dropout is skipped (this method is inference-only).
+          - Each block updates its own cache and returns the new version.
+          - caches is a plain Python list; we rebuild it functionally each call
+            rather than mutating in place (JAX's functional programming style).
+
+        Args:
+            key:      PRNG key forwarded to each block's MLP.
+            tokens:   Token IDs, shape (n_tokens,).
+            caches:   List of KVCache — one per transformer layer.
+            start_pos: Absolute position of tokens[0] in the full sequence.
+
+        Returns:
+            (final hidden states (n_tokens, n_embed), list of updated KVCaches)
+        """
+        # Token embeddings — RoPE inside each attention layer provides position
+        # information, so no separate positional embedding table is needed.
+        x_SxE = jax.vmap(self.wte)(tokens)  # (n_tokens, n_embed)
+
+        # No embedding dropout at inference time.
+
+        new_caches = []
+        for block, cache in zip(self.h, caches):
+            x_SxE, new_cache = block.forward_with_cache(key, x_SxE, cache, start_pos)
+            new_caches.append(new_cache)
+
+        x_SxE = jax.vmap(self.ln_f)(x_SxE)
+        return x_SxE, new_caches
 
 
 class GPT(eqx.Module):
@@ -333,5 +436,143 @@ class GPT(eqx.Module):
             next_token = jax.random.categorical(sample_key, logits[0])
             print(f"Generated token {i + 1}/{max_new_tokens}: {next_token}")
             tokens = jnp.append(tokens, next_token)
+
+        return tokens
+
+    def make_kv_cache(self, max_seq_len: int) -> List[attention.KVCache]:
+        """
+        Allocate a zero-filled KV cache for every transformer layer.
+
+        Cache dimensions per layer:
+            k_KVHxSxD : (n_kv_heads, max_seq_len, head_dim)
+            v_KVHxSxD : (n_kv_heads, max_seq_len, head_dim)
+
+        For MHA, n_kv_heads == n_heads.
+        For GQA, n_kv_heads < n_heads — the reduced KV budget is the whole
+        point: the cache is (n_heads / n_kv_heads)× smaller than MHA.
+
+        Args:
+            max_seq_len: Total position capacity (prompt + max_new_tokens).
+
+        Returns:
+            List of KVCache (one per layer), all zero-initialised.
+        """
+        caches = []
+        for block in self.transformer.h:
+            mha = block.attn.mha
+            if isinstance(mha, attention.GroupedQueryAttention):
+                n_kv = mha.n_kv_heads
+            else:  # MultiHeadAttention — n_kv_heads == n_heads
+                n_kv = mha.n_heads
+            head_dim = mha.n_embed // mha.n_heads
+            caches.append(
+                attention.KVCache(
+                    k_KVHxSxD=jnp.zeros((n_kv, max_seq_len, head_dim)),
+                    v_KVHxSxD=jnp.zeros((n_kv, max_seq_len, head_dim)),
+                )
+            )
+        return caches
+
+    def decode_with_kv_cache(
+        self,
+        key: PRNGKeyArray,
+        initial_tokens: Integer[Array, "n_tokens"],
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+    ) -> Integer[Array, "n_tokens + max_new_tokens"]:
+        """
+        Autoregressive text generation with KV caching.
+
+        Why KV cache?
+        -------------
+        decode_slow re-runs the *full* forward pass at each of the T generation
+        steps.  For a prompt of length P:
+
+            decode_slow:           T full forward passes, each O((P+t)²) attention
+                                   Total: O(T · (P+T)²)  — quadratic in T
+
+            decode_with_kv_cache:  Two phases (explained below)
+                                   Total: O(P² + T·P)     — linear in T
+
+        Phase 1 — Prefill (one forward pass over the entire prompt)
+        -----------------------------------------------------------
+        All P prompt tokens are processed in *parallel*, exactly as in training.
+        Each layer writes its K and V vectors for positions 0..P-1 into the cache.
+        At the end we read the last position's embedding to predict the first new
+        token.  Cost: O(P²).
+
+        Phase 2 — Decode (T single-token steps)
+        ----------------------------------------
+        At each step we feed *one* token into the transformer.  That token's Q
+        is dotted against all P+t cached K vectors — no re-projection of the
+        prompt is ever needed again.  Cost per step: O(P+t) ≈ O(P).
+        Total decode cost: O(T·P).
+
+        Key/Value lifecycle
+        -------------------
+        After prefill the cache holds positions 0..P-1.
+        Decode step 0 writes position P.
+        Decode step 1 writes position P+1.  … and so on.
+
+        Args:
+            key:            PRNG key for sampling.
+            initial_tokens: Prompt token IDs, shape (n_tokens,).
+            max_new_tokens: Number of tokens to generate.
+            temperature:    Softmax temperature (1.0 = unchanged, <1 = sharper,
+                            >1 = more uniform / random).
+            top_k:          If set, restrict sampling to the top-k most likely
+                            next tokens at each step.
+
+        Returns:
+            Token array of shape (n_tokens + max_new_tokens,) containing the
+            original prompt followed by the generated tokens.
+        """
+        prompt_len = initial_tokens.shape[0]
+        max_seq_len = prompt_len + max_new_tokens
+
+        # Allocate zero-filled caches (one KVCache per transformer layer)
+        caches = self.make_kv_cache(max_seq_len)
+
+        prefill_key, gen_key = jax.random.split(key)
+
+        # ── Phase 1: Prefill ─────────────────────────────────────────────────
+        # Process all prompt tokens in one shot, filling positions 0..P-1.
+        # embeddings_PxE[i] holds the hidden state at position i, which the
+        # model uses to predict the token at position i+1.
+        embeddings_PxE, caches = self.transformer.forward_with_cache(
+            prefill_key, initial_tokens, caches, start_pos=0
+        )
+
+        tokens = initial_tokens
+
+        # ── Phase 2: Generate ─────────────────────────────────────────────────
+        for i in range(max_new_tokens):
+            step_key = jax.random.fold_in(gen_key, i)
+            model_key, sample_key = jax.random.split(step_key)
+
+            # embeddings_PxE[-1] is the hidden state at the *last processed*
+            # position.  The language head converts it to next-token logits.
+            logits_V = self.lm_head(embeddings_PxE[-1])  # (vocab_size,)
+            logits_V = logits_V / temperature
+
+            if top_k is not None:
+                top_logits_K, top_tokens_K = jax.lax.top_k(
+                    logits_V, min(top_k, logits_V.shape[-1])
+                )
+                token_idx = jax.random.categorical(sample_key, top_logits_K)
+                next_token = top_tokens_K[token_idx]
+            else:
+                next_token = jax.random.categorical(sample_key, logits_V)
+
+            tokens = jnp.append(tokens, next_token)
+
+            # Feed the newly sampled token into the model at absolute position
+            # (prompt_len + i).  This writes its K/V into the cache and
+            # produces the embedding we will use to sample the *next* token.
+            current_pos = prompt_len + i
+            embeddings_PxE, caches = self.transformer.forward_with_cache(
+                model_key, jnp.array([next_token]), caches, start_pos=current_pos
+            )
 
         return tokens
